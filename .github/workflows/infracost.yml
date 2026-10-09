@@ -1,0 +1,142 @@
+# Infracost cost estimation.
+#   • push to a feature branch → full cost breakdown in the job summary (+ JSON artifact)
+#   • pull request into dev/qa/main → cost diff vs. the base branch, posted/updated as a PR comment
+# Also callable from other repositories via `workflow_call`.
+#
+# Requires the INFRACOST_API_KEY repository/organization secret (free key: `infracost auth login`).
+# Usage assumptions for usage-based S3 pricing live in infracost-usage.yml.
+
+name: infracost
+run-name: "Infracost · ${{ github.event_name }} · ${{ github.ref_name }}"
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - qa
+      - dev
+    paths:
+      - "**/*.tf"
+      - "infracost-usage.yml"
+      - ".github/workflows/infracost.yml"
+  pull_request:
+    branches:
+      - dev
+      - qa
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      terraform_path:
+        description: "Path of the Terraform root module to estimate."
+        type: string
+        default: "examples"
+      usage_file:
+        description: "Infracost usage file (empty to skip)."
+        type: string
+        default: "infracost-usage.yml"
+    secrets:
+      INFRACOST_API_KEY:
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infracost-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_PATH: ${{ inputs.terraform_path || 'examples' }}
+  USAGE_FILE: ${{ inputs.usage_file || 'infracost-usage.yml' }}
+
+jobs:
+  infracost:
+    name: Infracost
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      - name: Check Infracost API key
+        id: key
+        run: |
+          if [[ -z "${INFRACOST_API_KEY}" ]]; then
+            echo "::warning title=Infracost::INFRACOST_API_KEY secret is not set - skipping cost estimate."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Infracost
+        if: steps.key.outputs.present == 'true'
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # ── Pull request: baseline from the base branch ──────────────────────
+      - name: Checkout base branch
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Generate baseline cost
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        run: |
+          usage=(); [[ -n "$USAGE_FILE" && -f "$USAGE_FILE" ]] && usage=(--usage-file "$USAGE_FILE")
+          if [[ -d "$TF_PATH" ]]; then
+            infracost breakdown --path "$TF_PATH" "${usage[@]}" --format json --out-file /tmp/infracost-base.json
+          else
+            echo "Base branch has no ${TF_PATH}; using an empty baseline."
+            echo '{"version":"0.2","projects":[]}' > /tmp/infracost-base.json
+          fi
+
+      # ── Current commit ───────────────────────────────────────────────────
+      - name: Checkout current commit
+        if: steps.key.outputs.present == 'true'
+        uses: actions/checkout@v7.0.1
+
+      - name: 💰 Cost breakdown (push)
+        if: steps.key.outputs.present == 'true' && github.event_name != 'pull_request'
+        run: |
+          usage=(); [[ -n "$USAGE_FILE" && -f "$USAGE_FILE" ]] && usage=(--usage-file "$USAGE_FILE")
+          infracost breakdown --path "$TF_PATH" "${usage[@]}" --format json --out-file /tmp/infracost.json
+          infracost output --path /tmp/infracost.json --format table
+          {
+            echo "## 💰 Infracost estimate — \`${GITHUB_REF_NAME}\`"
+            infracost output --path /tmp/infracost.json --format github-comment --show-skipped
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 💸 Cost diff (pull request)
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        run: |
+          usage=(); [[ -n "$USAGE_FILE" && -f "$USAGE_FILE" ]] && usage=(--usage-file "$USAGE_FILE")
+          infracost diff --path "$TF_PATH" "${usage[@]}" --compare-to /tmp/infracost-base.json \
+            --format json --out-file /tmp/infracost.json
+          infracost output --path /tmp/infracost.json --format diff
+          infracost output --path /tmp/infracost.json --format github-comment >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 💬 Post Infracost comment
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # --behavior=update edits the existing Infracost comment instead of adding a new one per push.
+          infracost comment github --path /tmp/infracost.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --pull-request "$PR_NUMBER" \
+            --github-token "$GITHUB_TOKEN" \
+            --behavior update
+
+      - name: Upload Infracost report
+        if: steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-${{ github.run_id }}
+          path: /tmp/infracost.json
+          retention-days: 14

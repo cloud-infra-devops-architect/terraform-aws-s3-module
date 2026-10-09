@@ -1,0 +1,19 @@
+# Gitleaks configuration for terraform-aws-s3-module
+# Run locally: gitleaks git --config .gitleaks.toml --redact --verbose
+
+title = "terraform-aws-s3-module gitleaks config"
+
+[extend]
+# Start from the upstream default ruleset (AWS keys, GitHub tokens, private keys, ...).
+useDefault = true
+
+[allowlist]
+description = "Documentation placeholders and example values"
+paths = [
+  '''\.terraform/''',
+  '''\.terraform\.lock\.hcl''',
+]
+regexes = [
+  '''123456789012''',
+  '''11111111-2222-3333-4444-555555555555''',
+]

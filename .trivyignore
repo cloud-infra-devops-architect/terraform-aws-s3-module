@@ -1,0 +1,13 @@
+# Trivy suppressions for terraform-aws-s3-module.
+# Every entry MUST have a justification. Review quarterly.
+# Both the legacy (AVD-) and current IDs are listed for compatibility across Trivy versions.
+
+# S3 server access logging is supported but optional (var.enable_access_logging);
+# the target log bucket is owned by the consuming account/landing zone.
+AVD-AWS-0089
+AWS-0089
+
+# SSE-S3 (AES256) is an explicitly supported encryption option (var.encryption_type);
+# consumers that require a CMK select SSE-KMS or DSSE-KMS.
+AVD-AWS-0132
+AWS-0132

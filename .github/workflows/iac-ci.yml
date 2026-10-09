@@ -1,0 +1,445 @@
+# Reusable IaC CI workflow for Terraform modules (call it with `uses:` from any repo).
+#
+# Gates (every one must pass for the "CI Gate" job to succeed):
+#   🛡️ Checkov · 🔍 Trivy · 🧹 TFLint · 🔐 Gitleaks           — every push and PR
+#   🧪 examples/{main,variables,outputs}.tf + examples/README.md — every push and PR
+#   📘 README.md in the module root                            — every push and PR
+#   🤖 .amazonq/rules/*.md                                      — every push and PR
+#   ⚙️ .pre-commit-config.yaml, .tflint.hcl, trivy.yaml         — every push and PR
+#   🎨 terraform fmt · 🚀 init · ✅ validate · 📋 plan           — every pull request
+#
+# A failed gate marks the pushed commit ❌ and, with the ruleset created by
+# scripts/configure-branch-protection.sh (required check "<caller job name> / CI Gate"),
+# blocks merging the PR into dev, qa or main.
+
+name: reusable-iac-ci
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Path of the Terraform module root, relative to the repository root."
+        type: string
+        default: "."
+      example_directory:
+        description: "Path (relative to working_directory) of the example root module used for init/validate/plan."
+        type: string
+        default: "examples"
+      terraform_version:
+        description: "Terraform CLI version to install."
+        type: string
+        default: "latest"
+      tflint_version:
+        description: "TFLint version to install."
+        type: string
+        default: "v0.64.0"
+      trivy_version:
+        description: "Trivy version to install."
+        type: string
+        default: "v0.70.0"
+      gitleaks_version:
+        description: "Gitleaks version to install (without the leading v)."
+        type: string
+        default: "8.27.2"
+      checkov_version:
+        description: "Checkov version to install (empty = latest)."
+        type: string
+        default: ""
+      aws_region:
+        description: "AWS region used for the OIDC session that runs terraform plan."
+        type: string
+        default: "us-east-1"
+    secrets:
+      AWS_ROLE_ARN:
+        description: "IAM role assumed via GitHub OIDC for terraform plan (read-only permissions are sufficient)."
+        required: false
+      ROLE_SESSION_NAME:
+        description: "Optional STS session name for the OIDC role."
+        required: false
+    outputs:
+      result:
+        description: "Overall CI gate result (success or failure)."
+        value: ${{ jobs.ci-gate.outputs.result }}
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ── Steps 4–7: mandatory repository files ──────────────────────────────────
+  governance:
+    name: Governance Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      readme: ${{ steps.files.outputs.readme }}
+      examples: ${{ steps.files.outputs.examples }}
+      amazonq: ${{ steps.files.outputs.amazonq }}
+      configs: ${{ steps.files.outputs.configs }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check mandatory files
+        id: files
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # check <output-name> <label> <file>...  → writes success/failure to $GITHUB_OUTPUT
+          check() {
+            local key="$1" label="$2"; shift 2
+            local missing=()
+            for f in "$@"; do [[ -s "$f" ]] || missing+=("$f"); done
+            if ((${#missing[@]})); then
+              echo "::error title=${label}::Missing or empty: ${missing[*]}"
+              echo "${key}=failure" >> "$GITHUB_OUTPUT"
+            else
+              echo "✅ ${label}: $*"
+              echo "${key}=success" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          check readme   "Root README"     README.md
+          check examples "Examples"        examples/main.tf examples/variables.tf examples/outputs.tf examples/README.md
+          check configs  "Scanner configs" .pre-commit-config.yaml .tflint.hcl trivy.yaml
+
+          shopt -s nullglob
+          rules=(.amazonq/rules/*.md)
+          if ((${#rules[@]})); then
+            echo "✅ Amazon Q rules: ${rules[*]}"
+            echo "amazonq=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=Amazon Q rules::No rulesets found in .amazonq/rules/*.md"
+            echo "amazonq=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Steps 1–3: install and run Checkov, Trivy, TFLint, Gitleaks ────────────
+  security-scans:
+    name: Security Scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      checkov: ${{ steps.checkov.outcome }}
+      trivy: ${{ steps.trivy.outcome }}
+      tflint: ${{ steps.tflint.outcome }}
+      gitleaks: ${{ steps.gitleaks.outcome }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for Gitleaks
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Checkov
+        env:
+          CHECKOV_VERSION: ${{ inputs.checkov_version }}
+        run: |
+          pip install --quiet "checkov${CHECKOV_VERSION:+==${CHECKOV_VERSION}}"
+          checkov --version
+
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: ${{ inputs.trivy_version }}
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin "${TRIVY_VERSION}"
+          trivy --version
+
+      - name: Install TFLint
+        uses: terraform-linters/setup-tflint@v6.2.2
+        with:
+          tflint_version: ${{ inputs.tflint_version }}
+
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: ${{ inputs.gitleaks_version }}
+        run: |
+          curl -sSfLo /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: 🛡️ Checkov scan
+        id: checkov
+        continue-on-error: true
+        run: |
+          if [[ -f .checkov.yaml ]]; then
+            checkov --config-file .checkov.yaml
+          else
+            checkov --directory . --framework terraform --compact --quiet
+          fi
+
+      - name: 🔍 Trivy scan
+        id: trivy
+        continue-on-error: true
+        run: |
+          if [[ -f trivy.yaml ]]; then
+            trivy config --config trivy.yaml --exit-code 1 .
+          else
+            echo "::error::trivy.yaml not found"; exit 1
+          fi
+
+      - name: 🧹 TFLint scan
+        id: tflint
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids API rate limits when downloading plugins
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl" --format compact
+
+      - name: 🔐 Gitleaks scan
+        id: gitleaks
+        continue-on-error: true
+        run: |
+          args=(git --redact --verbose --report-format json --report-path /tmp/gitleaks-report.json)
+          [[ -f .gitleaks.toml ]] && args+=(--config .gitleaks.toml)
+          gitleaks "${args[@]}" .
+
+  # ── Steps 10–11: terraform fmt / init / validate / plan (pull requests) ────
+  terraform:
+    name: Terraform CI
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      id-token: write # OIDC for terraform plan
+      pull-requests: write # post plan to the PR
+    outputs:
+      fmt: ${{ steps.fmt.outcome }}
+      init: ${{ steps.init.outcome }}
+      validate: ${{ steps.validate.outcome }}
+      plan: ${{ steps.plan.outcome }}
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      EXAMPLE_DIR: ${{ inputs.working_directory }}/${{ inputs.example_directory }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ${{ secrets.ROLE_SESSION_NAME || 'github-actions-terraform-plan' }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: 🎨 terraform fmt
+        id: fmt
+        continue-on-error: true
+        working-directory: ${{ inputs.working_directory }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: 🚀 terraform init
+        id: init
+        continue-on-error: true
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform init -input=false
+
+      - name: ✅ terraform validate
+        id: validate
+        continue-on-error: true
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: terraform validate -no-color
+
+      - name: 📋 terraform plan
+        id: plan
+        continue-on-error: true
+        working-directory: ${{ env.EXAMPLE_DIR }}
+        run: |
+          set -o pipefail
+          if [[ -z "${AWS_ROLE_ARN}" ]]; then
+            echo "::error::AWS_ROLE_ARN secret is not set - terraform plan needs AWS credentials (GitHub OIDC)." | tee /tmp/plan.txt
+            exit 1
+          fi
+          terraform plan -input=false -no-color -lock=false -out=tfplan 2>&1 | tee /tmp/plan.txt
+
+      - name: Post plan to pull request
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          INIT: ${{ steps.init.outcome }}
+          VALIDATE: ${{ steps.validate.outcome }}
+          PLAN: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- terraform-plan-comment -->';
+            const icon = (o) => (o === 'success' ? '✅' : o === 'skipped' || !o ? '⏭️' : '❌');
+            let plan = fs.existsSync('/tmp/plan.txt') ? fs.readFileSync('/tmp/plan.txt', 'utf8') : 'No plan output.';
+            const max = 60000;
+            if (plan.length > max) plan = '…(truncated)…\n' + plan.slice(-max);
+            const body = [
+              marker,
+              '## 🏗️ Terraform CI',
+              '',
+              '| Step | Result |',
+              '|---|---|',
+              `| 🎨 Format | ${icon(process.env.FMT)} \`${process.env.FMT}\` |`,
+              `| 🚀 Init | ${icon(process.env.INIT)} \`${process.env.INIT}\` |`,
+              `| ✅ Validate | ${icon(process.env.VALIDATE)} \`${process.env.VALIDATE}\` |`,
+              `| 📋 Plan | ${icon(process.env.PLAN)} \`${process.env.PLAN}\` |`,
+              '',
+              '<details><summary>📄 Show plan output</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              `_Commit ${context.sha.substring(0, 7)} · triggered by @${context.actor}_`,
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            try {
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (e) {
+              core.warning(`Could not post plan comment (fork PRs have a read-only token): ${e.message}`);
+            }
+
+  # ── Steps 8–9 & 11: results table and the single required status check ───
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-latest
+    needs: [governance, security-scans, terraform]
+    if: always()
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      result: ${{ steps.gate.outputs.result }}
+    steps:
+      - name: Build results table
+        id: gate
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          CHECKOV: ${{ needs.security-scans.outputs.checkov }}
+          TRIVY: ${{ needs.security-scans.outputs.trivy }}
+          TFLINT: ${{ needs.security-scans.outputs.tflint }}
+          GITLEAKS: ${{ needs.security-scans.outputs.gitleaks }}
+          EXAMPLES: ${{ needs.governance.outputs.examples }}
+          README: ${{ needs.governance.outputs.readme }}
+          AMAZONQ: ${{ needs.governance.outputs.amazonq }}
+          CONFIGS: ${{ needs.governance.outputs.configs }}
+          TF_FMT: ${{ needs.terraform.outputs.fmt }}
+          TF_INIT: ${{ needs.terraform.outputs.init }}
+          TF_VALIDATE: ${{ needs.terraform.outputs.validate }}
+          TF_PLAN: ${{ needs.terraform.outputs.plan }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          GREEN=$'\e[1;32m'; RED=$'\e[1;31m'; GREY=$'\e[90m'; CYAN=$'\e[1;36m'; RESET=$'\e[0m'
+          failed=0
+          md="/tmp/ci-gate.md"
+
+          {
+            echo "<!-- iac-ci-gate -->"
+            echo "## 🚦 IaC CI Gate — Code Scan Results"
+            echo
+            echo "| # | Check | Scope | Result |"
+            echo "|:-:|---|---|:-:|"
+          } > "$md"
+
+          printf '\n%s%-4s %-34s %-10s%s\n' "$CYAN" "#" "Check" "Result" "$RESET"
+          printf '%s%s%s\n' "$CYAN" "──────────────────────────────────────────────────────" "$RESET"
+
+          # row <step#> <label> <scope> <outcome> [pr-only]
+          row() {
+            local n="$1" label="$2" scope="$3" outcome="${4:-}" pr_only="${5:-}"
+            local md_res con_res
+            if [[ -n "$pr_only" && "$IS_PR" != "true" ]]; then
+              md_res="⏭️ N/A (PR only)"; con_res="${GREY}⏭  N/A (PR only)${RESET}"
+            elif [[ "$outcome" == "success" ]]; then
+              md_res="✅ Pass"; con_res="${GREEN}✔ PASS${RESET}"
+            else
+              md_res="❌ Fail"; con_res="${RED}✘ FAIL${RESET} (${outcome:-not run})"; failed=1
+            fi
+            echo "| ${n} | ${label} | ${scope} | ${md_res} |" >> "$md"
+            printf '%-4s %-34s %s\n' "$n" "$label" "$con_res"
+          }
+
+          row 3  "🛡️ Checkov"            "IaC misconfiguration"              "$CHECKOV"
+          row 3  "🔍 Trivy"              "IaC misconfiguration & secrets"    "$TRIVY"
+          row 3  "🧹 TFLint"             "Terraform & AWS lint rules"        "$TFLINT"
+          row 3  "🔐 Gitleaks"           "Secrets in git history"            "$GITLEAKS"
+          row 4  "🧪 Examples"           "examples/{main,variables,outputs}.tf, README.md" "$EXAMPLES"
+          row 5  "📘 Root README"        "README.md"                         "$README"
+          row 6  "🤖 Amazon Q rules"     ".amazonq/rules/*.md"               "$AMAZONQ"
+          row 7  "⚙️ Scanner configs"    ".pre-commit-config.yaml, .tflint.hcl, trivy.yaml" "$CONFIGS"
+          row 10 "🎨 terraform fmt"      "Formatting"                        "$TF_FMT"      pr
+          row 10 "🚀 terraform init"     "Provider/module init"              "$TF_INIT"     pr
+          row 10 "✅ terraform validate" "Configuration validity"            "$TF_VALIDATE" pr
+          row 10 "📋 terraform plan"     "Plan against AWS (examples/)"      "$TF_PLAN"     pr
+
+          echo >> "$md"
+          if ((failed)); then
+            echo "### ❌ Overall: **FAILED** — fix the failing checks above; this commit/PR cannot be merged." >> "$md"
+            printf '\n%sOverall: FAILED%s\n' "$RED" "$RESET"
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "### ✅ Overall: **PASSED** — all gates are green." >> "$md"
+            printf '\n%sOverall: PASSED%s\n' "$GREEN" "$RESET"
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          fi
+          echo "_Run [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) · ${GITHUB_REF_NAME} · ${GITHUB_SHA::7}_" >> "$md"
+
+          cat "$md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post results table to pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- iac-ci-gate -->';
+            const body = fs.readFileSync('/tmp/ci-gate.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            try {
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (e) {
+              core.warning(`Could not post results comment: ${e.message}`);
+            }
+
+      - name: Enforce gate
+        if: steps.gate.outputs.result != 'success'
+        run: |
+          echo "::error title=CI Gate::One or more mandatory checks failed - see the results table in the job summary."
+          exit 1

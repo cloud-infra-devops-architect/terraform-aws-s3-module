@@ -1,0 +1,29 @@
+# Infracost usage assumptions for usage-based S3/KMS pricing (examples/ root module).
+# Tune per workload; values are monthly estimates. Reference:
+# https://www.infracost.io/docs/features/usage_based_resources/
+version: 0.1
+
+resource_usage:
+  module.s3_bucket.aws_s3_bucket.this:
+    standard:
+      storage_gb: 100 # data in S3 Standard before transition
+      monthly_tier_1_requests: 100000 # PUT, COPY, POST, LIST
+      monthly_tier_2_requests: 1000000 # GET, SELECT and others
+    intelligent_tiering:
+      frequent_access_storage_gb: 400
+      infrequent_access_storage_gb: 300
+      archive_instant_access_storage_gb: 200
+      monitored_objects: 1000000
+      monthly_tier_1_requests: 100000
+      monthly_tier_2_requests: 1000000
+      monthly_lifecycle_transition_requests: 50000
+    standard_infrequent_access:
+      storage_gb: 0
+      monthly_tier_1_requests: 0
+      monthly_tier_2_requests: 0
+      monthly_lifecycle_transition_requests: 0
+      monthly_data_retrieval_gb: 0
+
+  module.s3_bucket.aws_kms_key.this[0]:
+    monthly_requests: 50000 # low because S3 Bucket Keys are enabled
+

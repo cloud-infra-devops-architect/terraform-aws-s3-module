@@ -1,0 +1,32 @@
+# Trivy configuration for terraform-aws-s3-module
+# Run locally: trivy config --config trivy.yaml .
+# Docs: https://trivy.dev/latest/docs/references/configuration/config-file/
+
+# Exit with a non-zero code when misconfigurations are found (fails CI / pre-commit).
+exit-code: 1
+
+# Fail on everything except LOW/UNKNOWN; tune here rather than in CI.
+severity:
+  - CRITICAL
+  - HIGH
+  - MEDIUM
+
+format: table
+
+# Justified, reviewed suppressions live in .trivyignore (each entry has a reason).
+ignorefile: .trivyignore
+
+scan:
+  scanners:
+    - misconfig
+    - secret
+  skip-dirs:
+    - "**/.terraform"
+    - ".git"
+
+misconfiguration:
+  scanners:
+    - terraform
+  terraform:
+    # Do not scan third-party modules pulled into .terraform/.
+    exclude-downloaded-modules: true

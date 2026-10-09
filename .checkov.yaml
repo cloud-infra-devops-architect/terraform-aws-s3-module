@@ -1,0 +1,22 @@
+# Checkov configuration for terraform-aws-s3-module
+# Run locally: checkov --config-file .checkov.yaml
+# Resource-specific skips are declared inline (#checkov:skip=...) with justifications.
+
+directory:
+  - .
+framework:
+  - terraform
+  - secrets
+  - github_actions
+download-external-modules: false
+compact: true
+quiet: true
+soft-fail: false
+skip-path:
+  - .terraform
+  - examples/.terraform
+skip-check:
+  # Module sources pinned to a commit hash - examples use a local path ("../").
+  - CKV_TF_1
+  # Module sources pinned to a version tag - examples use a local path ("../").
+  - CKV_TF_2

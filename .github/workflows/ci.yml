@@ -1,0 +1,49 @@
+# Caller workflow: runs the reusable IaC CI on every feature-branch push and on
+# every pull request into dev, qa or main.
+#
+# Required status check for branch protection / rulesets:  "IaC CI / CI Gate"
+# (scripts/configure-branch-protection.sh creates the ruleset).
+
+name: iac-ci
+run-name: "IaC CI · ${{ github.event_name }} · ${{ github.ref_name }} · by @${{ github.actor }}"
+
+on:
+  push:
+    # Any branch except the protected ones is treated as a feature branch.
+    branches-ignore:
+      - main
+      - qa
+      - dev
+  pull_request:
+    branches:
+      - dev
+      - qa
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  iac-ci:
+    name: IaC CI
+    permissions:
+      contents: read
+      id-token: write # OIDC role for terraform plan
+      pull-requests: write # plan + results comments
+    uses: ./.github/workflows/iac-ci.yml
+    # From another repository, reference it as:
+    #   uses: <org>/terraform-aws-s3-module/.github/workflows/iac-ci.yml@<tag-or-sha>
+    with:
+      working_directory: "."
+      example_directory: "examples"
+      terraform_version: "latest"
+      aws_region: "us-east-1"
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      ROLE_SESSION_NAME: ${{ secrets.ROLE_SESSION_NAME }}
